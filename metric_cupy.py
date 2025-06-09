@@ -1,7 +1,8 @@
 import numpy as np
+import cupy as cp
 import nibabel as nib
-import cc3d
-import scipy
+# import cc3d
+import cupyx.scipy.ndimage as scipy_ndimage
 import os
 import pandas as pd
 import surface_distance
@@ -182,13 +183,22 @@ def get_LesionWiseScores(prediction_seg, gt_seg, label_value, dil_factor):
 
     ## Performing Dilation and CC analysis
 
-    dilation_struct = scipy.ndimage.generate_binary_structure(3, 2)
+    dilation_struct = scipy_ndimage.generate_binary_structure(3, 2)
 
-    gt_mat_cc = cc3d.connected_components(gt_mat, connectivity=26)
-    pred_mat_cc = cc3d.connected_components(pred_mat, connectivity=26)
+    # Convert to CuPy arrays for GPU processing
+    gt_mat_cp = cp.asarray(gt_mat)
+    pred_mat_cp = cp.asarray(pred_mat)
 
-    gt_mat_dilation = scipy.ndimage.binary_dilation(gt_mat, structure = dilation_struct, iterations = dil_factor)
-    gt_mat_dilation_cc = cc3d.connected_components(gt_mat_dilation, connectivity=26)
+    gt_mat_cc, _ = scipy_ndimage.label(gt_mat_cp, structure=dilation_struct)
+    pred_mat_cc, _ = scipy_ndimage.label(pred_mat_cp, structure=dilation_struct)
+
+    gt_mat_dilation = scipy_ndimage.binary_dilation(gt_mat_cp, structure=dilation_struct, iterations=dil_factor)
+    gt_mat_dilation_cc, _ = scipy_ndimage.label(gt_mat_dilation, structure=dilation_struct)
+
+    # Convert back to NumPy arrays for further processing
+    gt_mat_cc = cp.asnumpy(gt_mat_cc)
+    pred_mat_cc = cp.asnumpy(pred_mat_cc)
+    gt_mat_dilation_cc = cp.asnumpy(gt_mat_dilation_cc)
 
     gt_mat_combinedByDilation = get_GTseg_combinedByDilation(
                                                             gt_dilated_cc_mat = gt_mat_dilation_cc, 
@@ -214,7 +224,9 @@ def get_LesionWiseScores(prediction_seg, gt_seg, label_value, dil_factor):
         gt_tmp[gt_label_cc == gtcomp] = 1
 
         ## Extracting ROI GT lesion component
-        gt_tmp_dilation = scipy.ndimage.binary_dilation(gt_tmp, structure = dilation_struct, iterations = dil_factor)
+        gt_tmp_cp = cp.asarray(gt_tmp)
+        gt_tmp_dilation_cp = scipy_ndimage.binary_dilation(gt_tmp_cp, structure = dilation_struct, iterations = dil_factor)
+        gt_tmp_dilation = cp.asnumpy(gt_tmp_dilation_cp)
 
         # Volume of lesion
         gt_vol = np.sum(gt_tmp)*sx*sy*sz 
