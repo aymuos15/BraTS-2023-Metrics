@@ -1,190 +1,277 @@
-import os
-import glob
-import nibabel as nib
+"""
+BraTS-MET Dataset Evaluation Script
+
+This module evaluates segmentation predictions against ground truth data
+for the BraTS-MET challenge dataset.
+"""
+
+import warnings
+from pathlib import Path
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
-from metrics import get_LesionWiseResults
-# from metric_cupy import get_LesionWiseResults
 
-def analyze_brats_predictions():
-    """
-    Iterate through BraTS-MET dataset segmentation files and their corresponding predictions
-    """
-    # Define paths
-    dataset_root = "dataset"
-    testing_data_path = os.path.join(dataset_root, "ASNR-MICCAI-BraTS2023-MET-Challenge-TestingData")
-    predictions_path = os.path.join(dataset_root, "BratSMets_PredictedSegs", "PredictedSegs")
-    
-    # Get list of prediction teams/methods
-    prediction_teams = [
-        "CNMC_PMI2023",
-        "MIA_SINTEF", 
-        "NVAUTO",
-        "S_Y",
-        "blackbean",
-        "i_sahajmistry"
-    ]
-    
-    # Get all case directories
-    case_dirs = glob.glob(os.path.join(testing_data_path, "BraTS-MET-*-000"))
+# Configure warnings
+warnings.filterwarnings(
+    "ignore", 
+    message="CuPy may not function correctly because multiple CuPy packages are installed",
+    category=UserWarning
+)
+warnings.filterwarnings("ignore")
 
-    # # Taking the first 2 cases for testing
-    # case_dirs = case_dirs[2:4]
+from metric_cupy import get_LesionWiseResults
 
-    case_dirs.sort()
+
+@dataclass
+class EvaluationConfig:
+    """Configuration for BraTS evaluation."""
+    dataset_root: Path = Path("dataset")
+    prediction_teams: List[str] = None
+    override_dilation: Optional[int] = None
+    override_threshold: Optional[int] = None
+    output_dir: Optional[Path] = None
     
-    print(f"Found {len(case_dirs)} cases")
-    print(f"Found {len(prediction_teams)} prediction teams")
+    def __post_init__(self):
+        if self.prediction_teams is None:
+            self.prediction_teams = [
+                "NVAUTO",
+                "S_Y",
+                "blackbean",
+                # "i_sahajmistry",
+                # "MIA_SINTEF",
+                # "CNMC_PMI2023",
+            ]
     
-    # Initialize results storage
-    all_results = []
+    @property
+    def testing_data_path(self) -> Path:
+        """Path to testing data."""
+        return self.dataset_root / "ASNR-MICCAI-BraTS2023-MET-Challenge-TestingData"
     
-    # Iterate through each case
-    for case_dir in tqdm(case_dirs, desc="Processing cases", unit="case"):
-        case_name = os.path.basename(case_dir)
-        print(f"\nProcessing case: {case_name}")
+    @property
+    def predictions_path(self) -> Path:
+        """Path to predictions."""
+        return self.dataset_root / "BratSMets_PredictedSegs" / "PredictedSegs"
+    
+    @property
+    def param_description(self) -> str:
+        """Parameter description for filenames."""
+        if self.override_dilation is not None or self.override_threshold is not None:
+            return f"dil_{self.override_dilation}_thresh_{self.override_threshold}"
+        return "default"
+
+
+class BratsEvaluator:
+    """Evaluates BraTS-MET predictions against ground truth."""
+    
+    def __init__(self, config: EvaluationConfig):
+        self.config = config
+        self._validate_paths()
+    
+    def _validate_paths(self) -> None:
+        """Validate that required paths exist."""
+        if not self.config.testing_data_path.exists():
+            raise FileNotFoundError(f"Testing data path not found: {self.config.testing_data_path}")
+        if not self.config.predictions_path.exists():
+            raise FileNotFoundError(f"Predictions path not found: {self.config.predictions_path}")
+    
+    def _get_case_directories(self) -> List[Path]:
+        """Get sorted list of case directories."""
+        pattern = "BraTS-MET-*-000"
+        case_dirs = list(self.config.testing_data_path.glob(pattern))
         
-        # Path to ground truth segmentation
-        gt_seg_path = os.path.join(case_dir, f"{case_name}-seg.nii.gz")
+        # TODO: Remove this testing limitation
+        # case_dirs = case_dirs[1:3]  # Testing with specific cases
         
-        if not os.path.exists(gt_seg_path):
-            print(f"  Warning: Ground truth segmentation not found: {gt_seg_path}")
-            continue
+        return sorted(case_dirs)
+    
+    def _evaluate_case_team(self, case_dir: Path, team: str) -> Optional[Dict]:
+        """Evaluate a single case for a specific team."""
+        case_name = case_dir.name
+        gt_seg_path = case_dir / f"{case_name}-seg.nii.gz"
+        pred_path = self.config.predictions_path / team / f"{case_name}.nii.gz"
+        
+        if not gt_seg_path.exists() or not pred_path.exists():
+            return None
+        
+        results = get_LesionWiseResults(
+            str(pred_path),
+            str(gt_seg_path),
+            challenge_name="BraTS-MET",
+            override_dilation=self.config.override_dilation,
+            override_threshold=self.config.override_threshold
+        )
+        
+        return {
+            'case': case_name,
+            'team': team,
+            'results': results
+        }
+    
+    def evaluate_all(self) -> pd.DataFrame:
+        """Run evaluation for all cases and teams."""
+        case_dirs = self._get_case_directories()
+        all_results = []
+        
+        for case_dir in tqdm(case_dirs, desc="Processing cases"):
+            for team in tqdm(self.config.prediction_teams, 
+                           desc=f"Teams for {case_dir.name}", 
+                           leave=False):
+                result = self._evaluate_case_team(case_dir, team)
+                if result is not None:
+                    all_results.append(result)
+        
+        return self._create_summary_table(all_results)
+    
+    def _extract_team_metrics(self, all_results: List[Dict]) -> Dict[str, Dict[str, List[float]]]:
+        """Extract metrics by team and label."""
+        team_metrics = {
+            team: {'ET': [], 'TC': [], 'WT': []} 
+            for team in self.config.prediction_teams
+        }
+        
+        for result in all_results:
+            team = result['team']
+            metrics_df = result['results']
             
-        # Load ground truth segmentation
-        try:
-            gt_seg = nib.load(gt_seg_path)
-            gt_data = gt_seg.get_fdata()
-            print(f"  Ground truth shape: {gt_data.shape}")
-            print(f"  Ground truth unique values: {np.unique(gt_data)}")
-        except Exception as e:
-            print(f"  Error loading ground truth: {e}")
-            continue
+            for _, row in metrics_df.iterrows():
+                label = row['Labels']
+                dice_score = row['LesionWise_Score_Dice']
+                
+                if label in team_metrics[team]:
+                    team_metrics[team][label].append(dice_score)
         
-        # Iterate through each prediction team
-        for team in tqdm(prediction_teams, desc=f"  Teams for {case_name}", unit="team", leave=False):
-            pred_path = os.path.join(predictions_path, team, f"{case_name}.nii.gz")
+        return team_metrics
+    
+    def _calculate_team_statistics(self, team_metrics: Dict) -> List[Dict]:
+        """Calculate statistics for each team."""
+        summary_data = []
+        
+        for team in self.config.prediction_teams:
+            row = {'Team Name': team}
             
-            if os.path.exists(pred_path):
-                # Load prediction
-                pred_seg = nib.load(pred_path)
-                pred_data = pred_seg.get_fdata()
-                
-                print(f"    {team}: shape={pred_data.shape}, unique_values={np.unique(pred_data)}")
-                
-                # Run BraTS-MET evaluation
-                results = get_LesionWiseResults(
-                    pred_path, 
-                    gt_seg_path, 
-                    challenge_name="BraTS-MET"
-                )
-                print(f"      Lesion-wise results: {results}")
-                
-                # Store results for table generation
-                result_row = {
-                    'case': case_name,
-                    'team': team,
-                    'results': results
-                }
-                all_results.append(result_row)
-                
-            else:
-                print(f"    {team}: Prediction file not found")
-    
-    # Create summary table
-    create_summary_table(all_results, prediction_teams)
-
-def create_summary_table(all_results, prediction_teams):
-    """Create a summary table with team rankings similar to the provided image"""
-    
-    # Initialize data storage
-    team_metrics = {team: {'ET': [], 'TC': [], 'WT': []} for team in prediction_teams}
-    
-    # Extract metrics from results
-    for result in all_results:
-        team = result['team']
-        metrics_df = result['results']
-        
-        # Extract Dice scores from the DataFrame
-        # The DataFrame has rows for WT, TC, ET with LesionWise_Score_Dice column
-        for _, row in metrics_df.iterrows():
-            label = row['Labels']
-            dice_score = row['LesionWise_Score_Dice']
+            for metric in ['ET', 'TC', 'WT']:
+                scores = team_metrics[team][metric]
+                if scores:
+                    row.update({
+                        f'{metric}_score': np.mean(scores),
+                        f'{metric}_std': np.std(scores),
+                        f'{metric}_median': np.median(scores)
+                    })
+                else:
+                    row.update({
+                        f'{metric}_score': 0.0,
+                        f'{metric}_std': 0.0,
+                        f'{metric}_median': 0.0
+                    })
             
-            if label in team_metrics[team]:
-                team_metrics[team][label].append(dice_score)
-    
-    # Calculate mean, std, and median for each team and metric
-    summary_data = []
-    
-    for team in prediction_teams:
-        row = {'Team Name': team}
+            summary_data.append(row)
         
+        return summary_data
+    
+    def _add_rankings(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add ranking columns to the dataframe."""
         for metric in ['ET', 'TC', 'WT']:
-            scores = team_metrics[team][metric]
-            if scores:
-                mean_score = np.mean(scores)
-                std_score = np.std(scores)
-                median_score = np.median(scores)
-                row[f'{metric}_score'] = mean_score
-                row[f'{metric}_std'] = std_score
-                row[f'{metric}_median'] = median_score
-            else:
-                row[f'{metric}_score'] = 0.0
-                row[f'{metric}_std'] = 0.0
-                row[f'{metric}_median'] = 0.0
+            df[f'{metric}_rank'] = df[f'{metric}_score'].rank(
+                ascending=False, method='min'
+            ).astype(int)
         
-        summary_data.append(row)
+        # Sort by average ranking
+        df['avg_rank'] = df[['ET_rank', 'TC_rank', 'WT_rank']].mean(axis=1)
+        return df.sort_values('avg_rank').reset_index(drop=True)
     
-    # Create DataFrame
-    df = pd.DataFrame(summary_data)
-    
-    # Add rankings
-    for metric in ['ET', 'TC', 'WT']:
-        df[f'{metric}_rank'] = df[f'{metric}_score'].rank(ascending=False, method='min').astype(int)
-    
-    # Sort by average ranking
-    avg_ranks = []
-    for _, row in df.iterrows():
-        avg_rank = (row['ET_rank'] + row['TC_rank'] + row['WT_rank']) / 3
-        avg_ranks.append(avg_rank)
-    
-    df['avg_rank'] = avg_ranks
-    df = df.sort_values('avg_rank').reset_index(drop=True)
-    
-    # Create formatted display table using pandas
-    display_df = pd.DataFrame()
-    display_df['Team Name'] = df['Team Name'].apply(lambda x: 
-        'isahajmistry' if x == 'i_sahajmistry' else
-        'MIASINTEF' if x == 'MIA_SINTEF' else
-        'SY' if x == 'S_Y' else
-        'CNMCPMI2023' if x == 'CNMC_PMI2023' else x)
-    
-    # Format columns for each metric with mean ± std (median)
-    for metric in ['ET', 'TC', 'WT']:
-        score_col = f'{metric}_score'
-        std_col = f'{metric}_std'
-        median_col = f'{metric}_median'
-        rank_col = f'{metric}_rank'
+    def _create_summary_table(self, all_results: List[Dict]) -> pd.DataFrame:
+        """Create summary table with team rankings."""
+        team_metrics = self._extract_team_metrics(all_results)
+        summary_data = self._calculate_team_statistics(team_metrics)
         
-        display_df[f'{metric} Dice score'] = df.apply(
-            lambda row: f"{row[score_col]:.2f} ± {row[std_col]:.2f} ({row[median_col]:.2f})", axis=1)
-        display_df[f'{metric} Rank'] = df[rank_col]
+        df = pd.DataFrame(summary_data)
+        df = self._add_rankings(df)
+                
+        if self.config.output_dir:
+            self._save_results(df)
+        
+        return df
     
-    print("\n" + "="*120)
-    print("BRATS-MET EVALUATION RESULTS SUMMARY")
-    print("="*120)
+    def _format_display_table(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create formatted display table."""
+        # Team name mappings
+        name_mapping = {
+            'i_sahajmistry': 'isahajmistry',
+            'MIA_SINTEF': 'MIASINTEF',
+            'S_Y': 'SY',
+            'CNMC_PMI2023': 'CNMCPMI2023'
+        }
+        
+        display_df = pd.DataFrame()
+        display_df['Team Name'] = df['Team Name'].map(name_mapping).fillna(df['Team Name'])
+        
+        # Format metrics columns
+        for metric in ['ET', 'TC', 'WT']:
+            display_df[f'{metric} Dice score'] = df.apply(
+                lambda row: (f"{row[f'{metric}_score']:.2f} ± {row[f'{metric}_std']:.2f} "
+                           f"({row[f'{metric}_median']:.2f})"),
+                axis=1
+            )
+            display_df[f'{metric} Rank'] = df[f'{metric}_rank']
+        
+        return display_df
     
-    # Display the table using pandas
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', None)
-    pd.set_option('display.max_colwidth', None)
+    def _display_results(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Format results as a DataFrame."""
+        display_df = self._format_display_table(df)
+        
+        # Configure pandas display options
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
+        
+        return display_df
     
-    print(display_df.to_string(index=False))
+    def _save_results(self, df: pd.DataFrame) -> None:
+        """Save results to CSV file only."""
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save only raw data as CSV
+        csv_path = self.config.output_dir / f"summary_{self.config.param_description}.csv"
+        df.to_csv(csv_path, index=False)
+
+
+def analyze_brats_predictions(
+    override_dilation: Optional[int] = None,
+    override_threshold: Optional[int] = None,
+    output_dir: Optional[str] = "results"  # Default output directory
+) -> pd.DataFrame:
+    """
+    Analyze BraTS predictions with specified parameters.
     
-    return df
+    Args:
+        override_dilation: Override default dilation factor (0 to skip)
+        override_threshold: Override default volume threshold (0 for all lesions)
+        output_dir: Directory to save results
+    
+    Returns:
+        Summary DataFrame with evaluation results
+    """
+    config = EvaluationConfig(
+        override_dilation=override_dilation,
+        override_threshold=override_threshold,
+        output_dir=Path(output_dir) if output_dir else None
+    )
+    
+    evaluator = BratsEvaluator(config)
+    results_df = evaluator.evaluate_all()
+    
+    # Return formatted display table
+    return evaluator._display_results(results_df)
+
 
 if __name__ == "__main__":
-    # Run the analysis
-    analyze_brats_predictions() #? No exceptions found, for all cases
+    results = analyze_brats_predictions()
+    # To display results in a notebook or console
+    print("\n" + "=" * 120)
+    print("BRATS-MET EVALUATION RESULTS SUMMARY")
+    print("=" * 120)
+    print(results.to_string(index=False))

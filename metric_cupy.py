@@ -1,419 +1,314 @@
 import numpy as np
 import cupy as cp
 import nibabel as nib
-# import cc3d
 import cupyx.scipy.ndimage as scipy_ndimage
-import os
 import pandas as pd
-import surface_distance
-import sys
 import math
+
+def dice_gpu(im1, im2):
+    """
+    GPU-accelerated Dice score computation
+    """
+    im1 = cp.asarray(im1, dtype=cp.bool_)
+    im2 = cp.asarray(im2, dtype=cp.bool_)
+
+    if im1.shape != im2.shape:
+        raise ValueError("Shape mismatch: im1 and im2 must have the same shape.")
+
+    # Compute Dice coefficient on GPU
+    intersection = cp.logical_and(im1, im2)
+    dice_score = 2.0 * cp.sum(intersection) / (cp.sum(im1) + cp.sum(im2))
+    
+    return float(dice_score)
 
 def dice(im1, im2):
     """
-    Computes Dice score for two images
-
-    Parameters
-    ==========
-    im1: Numpy Array/Matrix; Predicted segmentation in matrix form 
-    im2: Numpy Array/Matrix; Ground truth segmentation in matrix form
-
-    Output
-    ======
-    dice_score: Dice score between two images
+    CPU-based Dice score for compatibility
     """
-
     im1 = np.asarray(im1).astype(bool)
     im2 = np.asarray(im2).astype(bool)
 
     if im1.shape != im2.shape:
         raise ValueError("Shape mismatch: im1 and im2 must have the same shape.")
 
-    # Compute Dice coefficient
     intersection = np.logical_and(im1, im2)
+    return 2.0 * np.sum(intersection) / (np.sum(im1) + np.sum(im2))
 
-    return 2. * (intersection.sum()) / (im1.sum() + im2.sum())
-
-def get_TissueWiseSeg(prediction_matrix, gt_matrix, tissue_type):
+def get_TissueWiseSeg_gpu(prediction_matrix, gt_matrix, tissue_type):
     """
-    Converts the segmentatations to isolate tissue types
-
-    Parameters
-    ==========
-    prediction_matrix: Numpy Array/Matrix; Predicted segmentation in matrix form 
-    gt_matrix: Numpy Array/Matrix; Ground truth segmentation in matrix form
-    tissue_type: str; Can be WT, ET or TC
-
-    Output
-    ======
-    prediction_matrix: Numpy Array/Matrix; Predicted segmentation in matrix form with 
-                       just tissue type mentioned
-    gt_matrix: Numpy Array/Matrix; Ground truth segmentation in matrix form with just 
-                       tissue type mentioned
+    GPU-accelerated tissue-wise segmentation extraction
     """
+    # Ensure inputs are CuPy arrays with consistent dtype
+    prediction_matrix = cp.asarray(prediction_matrix, dtype=cp.int32)
+    gt_matrix = cp.asarray(gt_matrix, dtype=cp.int32)
 
     if tissue_type == 'WT':
-        np.place(prediction_matrix, (prediction_matrix != 1) & (prediction_matrix != 2) & (prediction_matrix != 3), 0)
-        np.place(prediction_matrix, (prediction_matrix > 0), 1)
-        
-        np.place(gt_matrix, (gt_matrix != 1) & (gt_matrix != 2) & (gt_matrix != 3), 0)
-        np.place(gt_matrix, (gt_matrix > 0), 1)
-    
+        # Whole tumor: labels 1, 2, 3
+        pred_mask = (prediction_matrix == 1) | (prediction_matrix == 2) | (prediction_matrix == 3)
+        prediction_matrix = cp.where(pred_mask, 1, 0)
+
+        gt_mask = (gt_matrix == 1) | (gt_matrix == 2) | (gt_matrix == 3)
+        gt_matrix = cp.where(gt_mask, 1, 0)
+
     elif tissue_type == 'TC':
-        np.place(prediction_matrix, (prediction_matrix != 1)  & (prediction_matrix != 3), 0)
-        np.place(prediction_matrix, (prediction_matrix > 0), 1)
-        
-        np.place(gt_matrix, (gt_matrix != 1) & (gt_matrix != 3), 0)
-        np.place(gt_matrix, (gt_matrix > 0), 1)
-        
+        # Tumor core: labels 1, 3
+        pred_mask = (prediction_matrix == 1) | (prediction_matrix == 3)
+        prediction_matrix = cp.where(pred_mask, 1, 0)
+
+        gt_mask = (gt_matrix == 1) | (gt_matrix == 3)
+        gt_matrix = cp.where(gt_mask, 1, 0)
+
     elif tissue_type == 'ET':
-        np.place(prediction_matrix, (prediction_matrix != 3), 0)
-        np.place(prediction_matrix, (prediction_matrix > 0), 1)
-        
-        np.place(gt_matrix, (gt_matrix != 3), 0)
-        np.place(gt_matrix, (gt_matrix > 0), 1)
-    
+        # Enhancing tumor: label 3 only
+        pred_mask = (prediction_matrix == 3)
+        prediction_matrix = cp.where(pred_mask, 1, 0)
+
+        gt_mask = (gt_matrix == 3)
+        gt_matrix = cp.where(gt_mask, 1, 0)
+
     return prediction_matrix, gt_matrix
 
-
-def get_GTseg_combinedByDilation(gt_dilated_cc_mat, gt_label_cc):
+def get_GTseg_combinedByDilation_gpu(gt_dilated_cc_mat, gt_label_cc):
     """
-    Computes the Corrected Connected Components after combing lesions
-    together with respect to their dilation extent
-
-    Parameters
-    ==========
-    gt_dilated_cc_mat: Numpy Array/Matrix; Ground Truth Dilated Segmentation 
-                       after CC Analysis
-    gt_label_cc: Numpy Array/Matrix; Ground Truth Segmentation after 
-                       CC Analysis
-
-    Output
-    ======
-    gt_seg_combinedByDilation_mat: Numpy Array/Matrix; Ground Truth 
-                                   Segmentation after CC Analysis and 
-                                   combining lesions
-    """    
+    GPU-accelerated connected component combination after dilation
+    """
+    # Ensure inputs are CuPy arrays with consistent dtype
+    gt_dilated_cc_mat = cp.asarray(gt_dilated_cc_mat, dtype=cp.int32)
+    gt_label_cc = cp.asarray(gt_label_cc, dtype=cp.int32)
     
-    
-    gt_seg_combinedByDilation_mat = np.zeros_like(gt_dilated_cc_mat)
+    gt_seg_combinedByDilation_mat = cp.zeros_like(gt_dilated_cc_mat, dtype=cp.int32)
+    max_comp = int(cp.max(gt_dilated_cc_mat))
 
-    for comp in range(np.max(gt_dilated_cc_mat)):  
-        comp += 1
-
-        gt_d_tmp = np.zeros_like(gt_dilated_cc_mat)
-        gt_d_tmp[gt_dilated_cc_mat == comp] = 1
-        gt_d_tmp = (gt_label_cc*gt_d_tmp)
-
-        np.place(gt_d_tmp, gt_d_tmp > 0, comp)
+    for comp in range(1, max_comp + 1):
+        # Create mask for current component
+        comp_mask = (gt_dilated_cc_mat == comp)
+        gt_d_tmp = cp.where(comp_mask, gt_label_cc, 0)
+        
+        # Set all non-zero values to current component number
+        gt_d_tmp = cp.where(gt_d_tmp > 0, comp, 0)
         gt_seg_combinedByDilation_mat += gt_d_tmp
         
     return gt_seg_combinedByDilation_mat
 
-
 def get_LesionWiseScores(prediction_seg, gt_seg, label_value, dil_factor):
     """
-    Computes the Lesion-wise scores for pair of prediction and ground truth
-    segmentations
-
-    Parameters
-    ==========
-    prediction_seg: str; location of the prediction segmentation    
-    gt_label_cc: str; location of the gt segmentation
-    label_value: str; Can be WT, ET or TC
-    dil_factor: int; Used to perform dilation
-
-    Output
-    ======
-    tp: Number of TP lesions WRT prediction segmentation
-    fn: Number of FN lesions WRT prediction segmentation
-    fp: Number of FP lesions WRT prediction segmentation 
-    gt_tp: Number of Ground Truth TP lesions WRT prediction segmentation 
-    metric_pairs: list; All the lesion-wise metrics  
-    full_dice: Dice Score of the pair of segmentations
-    full_gt_vol: Total Ground Truth Segmenatation Volume
-    full_pred_vol: Total Prediction Segmentation Volume
+    GPU-accelerated lesion-wise score computation
     """
-
-    ## Get Prediction and GT segs matrix files
+    # Load segmentation files
     pred_nii = nib.load(prediction_seg)
     gt_nii = nib.load(gt_seg)
     pred_mat = pred_nii.get_fdata()
     gt_mat = gt_nii.get_fdata()
 
-    ## Get Spacing to computes volumes
-    ## Brats Assumes all spacing is 1x1x1mm3
+    # Get voxel spacing for volume calculations
     sx, sy, sz = pred_nii.header.get_zooms()
-
-    ## Get the prediction and GT matrix based on 
-    ## WT, TC, ET
-
-    pred_mat, gt_mat = get_TissueWiseSeg(
-                                prediction_matrix = pred_mat,
-                                gt_matrix = gt_mat,
-                                tissue_type = label_value
-                            )
     
-    ## Get Dice score for the full image
-    if np.all(gt_mat==0) and np.all(pred_mat==0):
+    # Extract specific tissue types on GPU
+    pred_mat_gpu, gt_mat_gpu = get_TissueWiseSeg_gpu(
+        prediction_matrix=pred_mat,
+        gt_matrix=gt_mat,
+        tissue_type=label_value
+    )
+    
+    # Calculate full image Dice score
+    if cp.all(gt_mat_gpu == 0) and cp.all(pred_mat_gpu == 0):
         full_dice = 1.0
     else:
-        full_dice = dice(
-                    pred_mat, 
-                    gt_mat
-                )
+        full_dice = dice_gpu(pred_mat_gpu, gt_mat_gpu)
     
-    ## Get HD95 sccre for the full image
+    # Calculate ground truth volume
+    full_gt_vol = float(cp.sum(gt_mat_gpu) * sx * sy * sz)
     
-    if np.all(gt_mat==0) and np.all(pred_mat==0):
-        full_hd95 = 0.0
-    else:
-        full_sd = surface_distance.compute_surface_distances(gt_mat.astype(int), 
-                                                             pred_mat.astype(int), 
-                                                             (sx,sy,sz))
-        full_hd95 = surface_distance.compute_robust_hausdorff(full_sd, 95)
-
-    ## Get Sensitivity and Specificity
-    full_sens, full_specs = get_sensitivity_and_specificity(result_array = pred_mat, 
-                                                            target_array = gt_mat)
-    
-    ## Get GT Volume and Pred Volume for the full image
-    full_gt_vol = np.sum(gt_mat)*sx*sy*sz
-    full_pred_vol = np.sum(pred_mat)*sx*sy*sz
-
-    ## Performing Dilation and CC analysis
-
+    # Set up for connected component analysis
     dilation_struct = scipy_ndimage.generate_binary_structure(3, 2)
-
-    # Convert to CuPy arrays for GPU processing
-    gt_mat_cp = cp.asarray(gt_mat)
-    pred_mat_cp = cp.asarray(pred_mat)
-
-    gt_mat_cc, _ = scipy_ndimage.label(gt_mat_cp, structure=dilation_struct)
-    pred_mat_cc, _ = scipy_ndimage.label(pred_mat_cp, structure=dilation_struct)
-
-    gt_mat_dilation = scipy_ndimage.binary_dilation(gt_mat_cp, structure=dilation_struct, iterations=dil_factor)
-    gt_mat_dilation_cc, _ = scipy_ndimage.label(gt_mat_dilation, structure=dilation_struct)
-
-    # Convert back to NumPy arrays for further processing
-    gt_mat_cc = cp.asnumpy(gt_mat_cc)
-    pred_mat_cc = cp.asnumpy(pred_mat_cc)
-    gt_mat_dilation_cc = cp.asnumpy(gt_mat_dilation_cc)
-
-    gt_mat_combinedByDilation = get_GTseg_combinedByDilation(
-                                                            gt_dilated_cc_mat = gt_mat_dilation_cc, 
-                                                            gt_label_cc = gt_mat_cc
-                                                        )
     
-    ## Performing the Lesion-By-Lesion Comparison
+    # Ensure consistent dtypes for connected component analysis
+    gt_mat_gpu = cp.asarray(gt_mat_gpu, dtype=cp.bool_)
+    pred_mat_gpu = cp.asarray(pred_mat_gpu, dtype=cp.bool_)
 
-    gt_label_cc = gt_mat_combinedByDilation
-    pred_label_cc = pred_mat_cc
+    # Perform connected component analysis on GPU
+    gt_mat_cc, _ = scipy_ndimage.label(gt_mat_gpu, structure=dilation_struct)
+    pred_mat_cc, _ = scipy_ndimage.label(pred_mat_gpu, structure=dilation_struct)
+    
+    # Convert to consistent integer dtype
+    gt_mat_cc = gt_mat_cc.astype(cp.int32)
+    pred_mat_cc = pred_mat_cc.astype(cp.int32)
 
-    gt_tp = []
-    tp = []
-    fn = []
-    fp = []
+    # Dilate ground truth for overlap analysis
+    if dil_factor > 0:
+        gt_mat_dilation = scipy_ndimage.binary_dilation(
+            gt_mat_gpu, structure=dilation_struct, iterations=dil_factor
+        )
+    else:
+        gt_mat_dilation = gt_mat_gpu.copy()
+        
+    gt_mat_dilation_cc, _ = scipy_ndimage.label(gt_mat_dilation, structure=dilation_struct)
+    gt_mat_dilation_cc = gt_mat_dilation_cc.astype(cp.int32)
+
+    # Combine ground truth lesions based on dilation (on GPU)
+    gt_label_cc = get_GTseg_combinedByDilation_gpu(
+        gt_dilated_cc_mat=gt_mat_dilation_cc, 
+        gt_label_cc=gt_mat_cc
+    )
+
+    # Initialize lists for lesion-wise analysis
+    gt_tp_lesions = []
+    tp_lesions = []
+    fn_lesions = []
     metric_pairs = []
 
-    for gtcomp in range(np.max(gt_label_cc)):
-        gtcomp += 1
+    # Get max component for iteration
+    max_gt_comp = int(cp.max(gt_label_cc))
 
-        ## Extracting current lesion
-        gt_tmp = np.zeros_like(gt_label_cc)
-        gt_tmp[gt_label_cc == gtcomp] = 1
-
-        ## Extracting ROI GT lesion component
-        gt_tmp_cp = cp.asarray(gt_tmp)
-        gt_tmp_dilation_cp = scipy_ndimage.binary_dilation(gt_tmp_cp, structure = dilation_struct, iterations = dil_factor)
-        gt_tmp_dilation = cp.asnumpy(gt_tmp_dilation_cp)
-
-        # Volume of lesion
-        gt_vol = np.sum(gt_tmp)*sx*sy*sz 
+    # Analyze each ground truth lesion
+    for gtcomp in range(1, max_gt_comp + 1):
+        # Extract current ground truth lesion on GPU
+        gt_tmp_gpu = cp.where(gt_label_cc == gtcomp, 1, 0).astype(cp.int32)
         
-        ## Extracting Predicted true positive lesions
-        pred_tmp = np.copy(pred_label_cc)
-        #pred_tmp = pred_tmp*gt_tmp
-        pred_tmp = pred_tmp*gt_tmp_dilation
-        intersecting_cc = np.unique(pred_tmp) 
-        intersecting_cc = intersecting_cc[intersecting_cc != 0] 
-        for cc in intersecting_cc:
-            tp.append(cc)
-
-        ## Isolating Predited Lesions to calulcate Metrics
-        pred_tmp = np.copy(pred_label_cc)
-        pred_tmp[np.isin(pred_tmp,intersecting_cc,invert=True)] = 0
-        pred_tmp[np.isin(pred_tmp,intersecting_cc)] = 1
-
-        ## Calculating Lesion-wise Dice and HD95
-        dice_score = dice(pred_tmp, gt_tmp)
-        surface_distances = surface_distance.compute_surface_distances(gt_tmp, pred_tmp, (sx,sy,sz))
-        hd = surface_distance.compute_robust_hausdorff(surface_distances, 95)
-
-        metric_pairs.append((intersecting_cc, 
-                            gtcomp, gt_vol, dice_score, hd))
+        # Calculate lesion volume
+        gt_vol = float(cp.sum(gt_tmp_gpu) * sx * sy * sz)
         
-        ## Extracting Number of TP/FP/FN and other data
-        if len(intersecting_cc) > 0:
-            gt_tp.append(gtcomp)
+        # Dilate current lesion for overlap detection
+        if dil_factor > 0:
+            gt_tmp_dilation_gpu = scipy_ndimage.binary_dilation(
+                gt_tmp_gpu.astype(cp.bool_), structure=dilation_struct, iterations=dil_factor
+            )
         else:
-            fn.append(gtcomp)
-
-    fp = np.unique(
-            pred_label_cc[np.isin(
-                pred_label_cc,tp+[0],invert=True)])
+            gt_tmp_dilation_gpu = gt_tmp_gpu.astype(cp.bool_)
+        
+        # Find predicted lesions that overlap with dilated ground truth
+        pred_tmp_gpu = cp.where(gt_tmp_dilation_gpu, pred_mat_cc, 0)
+        intersecting_cc = cp.unique(pred_tmp_gpu)
+        intersecting_cc = intersecting_cc[intersecting_cc > 0]  # Remove 0 value
+        intersecting_cc = [int(x) for x in cp.asnumpy(intersecting_cc)]
+        
+        # Add intersecting lesions to true positives
+        tp_lesions.extend(intersecting_cc)
+        
+        # Prepare mask of predicted lesions for metrics calculation
+        if len(intersecting_cc) > 0:
+            pred_tmp_gpu = cp.zeros_like(pred_mat_cc, dtype=cp.int32)
+            for cc_val in intersecting_cc:
+                pred_tmp_gpu = cp.where(pred_mat_cc == cc_val, 1, pred_tmp_gpu)
+            gt_tp_lesions.append(gtcomp)
+        else:
+            pred_tmp_gpu = cp.zeros_like(gt_tmp_gpu, dtype=cp.int32)
+            fn_lesions.append(gtcomp)
+        
+        # Calculate Dice score for this lesion on GPU
+        dice_score = dice_gpu(pred_tmp_gpu, gt_tmp_gpu)
+        
+        # Store metrics for this lesion
+        metric_pairs.append((intersecting_cc, gtcomp, gt_vol, dice_score))
     
-    return tp, fn, fp, gt_tp, metric_pairs, full_dice, full_hd95, full_gt_vol, full_pred_vol, full_sens, full_specs
+    # Find false positive lesions (those not matched to any ground truth)
+    all_pred_components = cp.unique(pred_mat_cc)
+    all_pred_components = all_pred_components[all_pred_components > 0]  # Remove 0
+    
+    fp_lesions_gpu = []
+    for comp in all_pred_components:
+        comp_int = int(comp)
+        if comp_int not in tp_lesions:
+            fp_lesions_gpu.append(comp_int)
+    
+    return tp_lesions, fn_lesions, fp_lesions_gpu, gt_tp_lesions, metric_pairs, full_dice, full_gt_vol
 
-
-def get_sensitivity_and_specificity(result_array, target_array):
-    """
-    This function is extracted from GaNDLF from mlcommons
-
-    You can find the documentation here - 
-
-    https://github.com/mlcommons/GaNDLF/blob/master/GANDLF/metrics/segmentation.py#L196
-
-    """
-    iC = np.sum(result_array)
-    rC = np.sum(target_array)
-
-    overlap = np.where((result_array == target_array), 1, 0)
-
-    # Where they agree are both equal to that value
-    TP = overlap[result_array == 1].sum()
-    FP = iC - TP
-    FN = rC - TP
-    TN = np.count_nonzero((result_array != 1) & (target_array != 1))
-
-    Sens = 1.0 * TP / (TP + FN + sys.float_info.min)
-    Spec = 1.0 * TN / (TN + FP + sys.float_info.min)
-
-    # Make Changes if both input and reference are 0 for the tissue type
-    if (iC == 0) and (rC == 0):
-        Sens = 1.0
-
-    return Sens, Spec
-
-
-
-def get_LesionWiseResults(pred_file, gt_file, challenge_name, output=None):
+def get_LesionWiseResults(pred_file, gt_file, challenge_name, output=None, override_dilation=None, override_threshold=None):
     """
     Computes the Lesion-wise scores for pair of prediction and ground truth
-    segmentations
-
-    Parameters
-    ==========
-    pred_file: str; location of the prediction segmentation    
-    gt_file: str; location of the gt segmentation
-    challenge_name: str; name of the challenge for parameters
-
-
-    Output
-    ======
-    Saves the performance metrics as CSVs
-    results_df: pd.DataFrame; lesion-wise results with other metrics
+    segmentations with GPU acceleration
     """
+    # Set parameters based on challenge type
+    challenge_params = {
+        'BraTS-GLI': (3, 50),
+        'BraTS-SSA': (3, 50),
+        'BraTS-MEN': (1, 50),
+        'BraTS-PED': (3, 50),
+        'BraTS-MET': (1, 2)
+    }
     
-    ## Dilation and Threshold Parameters
-    if challenge_name == 'BraTS-GLI':
-        dilation_factor = 3
-        lesion_volume_thresh = 50
-    elif challenge_name == 'BraTS-SSA':
-        dilation_factor = 3
-        lesion_volume_thresh = 50
-    elif challenge_name == 'BraTS-MEN':
-        dilation_factor = 1
-        lesion_volume_thresh = 50
-    elif challenge_name == 'BraTS-PED':
-        dilation_factor = 3
-        lesion_volume_thresh = 50
-    elif challenge_name == 'BraTS-MET':
-        dilation_factor = 1
-        lesion_volume_thresh = 2       
-        
+    # Get default parameters or use challenge-specific ones
+    dilation_factor, lesion_volume_thresh = challenge_params.get(
+        challenge_name, (3, 50)  # Default values if challenge not found
+    )
+    
+    # Override parameters if provided
+    if override_dilation is not None:
+        dilation_factor = override_dilation
+    
+    if override_threshold is not None:
+        lesion_volume_thresh = override_threshold
 
-    final_lesionwise_metrics_df = pd.DataFrame()
-    final_metrics_dict = dict()
+    final_metrics_dict = {}
     label_values = ['WT', 'TC', 'ET']
+    all_lesion_metrics = []
 
-    for l in range(len(label_values)):
-        tp, fn, fp, gt_tp, metric_pairs, full_dice, full_hd95, full_gt_vol, full_pred_vol, full_sens, full_specs = get_LesionWiseScores(
-                                                            prediction_seg = pred_file,
-                                                            gt_seg = gt_file,
-                                                            label_value = label_values[l],
-                                                            dil_factor = dilation_factor
-                                                        )
+    # Process each tissue type
+    for label in label_values:
+        tp_lesions, fn_lesions, fp_lesions, gt_tp_lesions, metric_pairs, full_dice, full_gt_vol = get_LesionWiseScores(
+            prediction_seg=pred_file,
+            gt_seg=gt_file,
+            label_value=label,
+            dil_factor=dilation_factor
+        )
         
+        # Create DataFrame with lesion metrics
         metric_df = pd.DataFrame(
-            metric_pairs, columns=['predicted_lesion_numbers', 'gt_lesion_numbers', 
-                                   'gt_lesion_vol', 'dice_lesionwise', 'hd95_lesionwise']
-                ).sort_values(by = ['gt_lesion_numbers'], ascending=True).reset_index(drop = True)
+            metric_pairs,
+            columns=['predicted_lesion_numbers', 'gt_lesion_numbers', 'gt_lesion_vol', 'dice_lesionwise']
+        ).sort_values(by=['gt_lesion_numbers'], ascending=True).reset_index(drop=True)
         
+        # Mark number of predicted lesions per ground truth lesion
         metric_df['_len'] = metric_df['predicted_lesion_numbers'].map(len)
-
-        ## Removing <= 50 lesions from analysis
-        fn_sub = (metric_df[(metric_df['_len'] == 0) &
-                  (metric_df['gt_lesion_vol'] <= lesion_volume_thresh)
-                  ]).shape[0]
         
+        # Add label information
+        metric_df['Label'] = label
         
-        gt_tp_sub = (metric_df[(metric_df['_len'] != 0) & 
-            (metric_df['gt_lesion_vol'] <= lesion_volume_thresh)
-            ]).shape[0]
+        # Replace infinity values
+        metric_df.replace([np.inf, -np.inf], 374, inplace=True)
         
+        # Filter metrics based on lesion volume threshold
+        small_fn = metric_df[(metric_df['_len'] == 0) & 
+                             (metric_df['gt_lesion_vol'] <= lesion_volume_thresh)].shape[0]
+        small_tp = metric_df[(metric_df['_len'] != 0) & 
+                             (metric_df['gt_lesion_vol'] <= lesion_volume_thresh)].shape[0]
         
-        metric_df['Label'] = [label_values[l]]*len(metric_df)
-        metric_df = metric_df.replace(np.inf, 374)
-
-        final_lesionwise_metrics_df = final_lesionwise_metrics_df.append(metric_df)
+        # Get metrics for lesions above threshold
         metric_df_thresh = metric_df[metric_df['gt_lesion_vol'] > lesion_volume_thresh]
         
+        # Calculate lesion-wise Dice score
         try:
-            lesion_wise_dice = np.sum(metric_df_thresh['dice_lesionwise'])/(len(metric_df_thresh) + len(fp))
+            if len(metric_df_thresh) + len(fp_lesions) > 0:
+                lesion_wise_dice = np.sum(metric_df_thresh['dice_lesionwise']) / (len(metric_df_thresh) + len(fp_lesions))
+            else:
+                lesion_wise_dice = 1.0
         except:
-            lesion_wise_dice = np.nan
-            
-        try:
-            lesion_wise_hd95 = (np.sum(metric_df_thresh['hd95_lesionwise']) + len(fp)*374)/(len(metric_df_thresh) + len(fp))
-        except:
-            lesion_wise_hd95 = np.nan
-
-        if math.isnan(lesion_wise_dice):
-            lesion_wise_dice = 1
-
-        if math.isnan(lesion_wise_hd95):
-            lesion_wise_hd95 = 0
+            lesion_wise_dice = 1.0
         
-        metrics_dict = {
-            'Num_TP' : len(gt_tp) - gt_tp_sub, # GT_TP
-            #'Num_TP' : len(tp),
-            'Num_FP' : len(fp),
-            'Num_FN' : len(fn) - fn_sub,
-            'Sensitivity': full_sens,
-            'Specificity': full_specs,
-            'Legacy_Dice' : full_dice,
-            'Legacy_HD95' : full_hd95,
-            'GT_Complete_Volume' : full_gt_vol,
-            'LesionWise_Score_Dice' : lesion_wise_dice,
-            'LesionWise_Score_HD95' : lesion_wise_hd95
+        # Handle NaN values
+        if math.isnan(lesion_wise_dice):
+            lesion_wise_dice = 1.0
+        
+        # Store metrics for this tissue type
+        final_metrics_dict[label] = {
+            'Num_TP': len(gt_tp_lesions) - small_tp,
+            'Num_FP': len(fp_lesions),
+            'Num_FN': len(fn_lesions) - small_fn,
+            'Legacy_Dice': full_dice,
+            'LesionWise_Score_Dice': lesion_wise_dice,
         }
-
-        final_metrics_dict[label_values[l]] = metrics_dict
-
-
-    #final_lesionwise_metrics_df.to_csv(os.path.split(pred_file)[0] + '/' +
-    #                                   os.path.split(pred_file)[1].split('.')[0] + 
-    #                                   '_lesionwise_metrics.csv',
-    #                                   index=False)
+        
+        # Collect all lesion metrics
+        all_lesion_metrics.append(metric_df)
     
-    
+    # Create final results DataFrame
     results_df = pd.DataFrame(final_metrics_dict).T
     results_df['Labels'] = results_df.index
     results_df = results_df.reset_index(drop=True)
-    results_df.insert(0, 'Labels', results_df.pop('Labels'))
-    results_df.replace(np.inf, 374, inplace=True)
+    results_df = results_df[['Labels'] + [col for col in results_df.columns if col != 'Labels']]
+    results_df.replace([np.inf, -np.inf], 374, inplace=True)
     
+    # Save results if output path is provided
     if output:
         results_df.to_csv(output, index=False)
     
