@@ -1,5 +1,0 @@
-Configuration,Runtime (seconds),Output Directory,Status
-Default (using defaults from metric_cupy.py),138.69372820854187,results/default,success
-"With dilation=0, using default threshold",137.38030457496643,results/dil_0_only,success
-"Using default dilation, with threshold=0",139.049644947052,results/thresh_0_only,success
-With dilation=0 and threshold=0,138.32941389083862,results/dil_0_thresh_0,success

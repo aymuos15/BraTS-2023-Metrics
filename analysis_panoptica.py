@@ -1,5 +1,5 @@
 """
-Simplified BraTS-MET Dataset Evaluation Script
+Simplified BraTS-MET Dataset Evaluation Script with Panoptica
 """
 
 import numpy as np
@@ -12,12 +12,13 @@ import argparse
 import warnings
 warnings.filterwarnings("ignore")
 
-from metrics import get_LesionWiseResults
+from metrics_panoptica import get_LesionWiseResults
 
 def evaluate_brats_predictions(
+    style="normal",
     dataset_root="dataset",
     teams=None,
-    dilation=None,
+    matcher=None,
     threshold=None,
     output_dir="results",
     num_cases=None
@@ -47,7 +48,7 @@ def evaluate_brats_predictions(
             
             if gt_file.exists() and pred_file.exists():
                 results = get_LesionWiseResults(
-                    str(pred_file), str(gt_file), override_dilation=dilation, override_threshold=threshold
+                    style, str(pred_file), str(gt_file), matcher=matcher, threshold=threshold
                 )
                 
                 for _, row in results.iterrows():
@@ -95,9 +96,10 @@ def evaluate_brats_predictions(
     # Save results
     if output_dir:
         Path(output_dir).mkdir(exist_ok=True)
-        # Fix: Make sure filename reflects the parameters used
-        filename = f"{output_dir}/results__dil_{dilation}__thresh_{threshold}.csv"
-        df.to_csv(filename, index=False)
+        if style == 'part':
+            df.to_csv(f"{output_dir}/results__part__match_{matcher}__matchthresh_{threshold}.csv", index=False)
+        else:
+            df.to_csv(f"{output_dir}/results__match_{matcher}__matchthresh_{threshold}.csv", index=False)
 
     return display_df
 
@@ -105,15 +107,18 @@ def evaluate_brats_predictions(
 def main():
     """Parse arguments and run evaluation."""
     parser = argparse.ArgumentParser(description="BraTS-MET Dataset Evaluation")
-    parser.add_argument("--dilation", type=int, default=None,
-                        help="Dilation value for evaluation")
-    parser.add_argument("--threshold", type=float, default=None,
+    parser.add_argument("--style", type=str, default="normal",
+                        help="Evaluation style: 'normal' or 'part'")
+    parser.add_argument("--matcher", type=str, default="naive",
+                        help="matcher for evaluation")
+    parser.add_argument("--threshold", type=float, default=0.000001,
                         help="Threshold value for evaluation")
 
     args = parser.parse_args()
     
     results = evaluate_brats_predictions(
-        dilation=args.dilation,
+        style=args.style,  # Pass the style parameter from command line
+        matcher=args.matcher,
         threshold=args.threshold,
     )
     
